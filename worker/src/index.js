@@ -197,10 +197,14 @@ async function handleLogs(env) {
 // ─────────────────────────────────────────────────────────────
 // File upload  (POST /upload)
 // Accepts multipart/form-data: file + company.
-// Stores to HubSpot File Manager and returns the public CDN URL.
-// Uses the same HubSpot OAuth credentials already configured.
+// Stores to Cloudinary and returns the secure public URL.
+// Uses signed uploads with CLOUDINARY_CLOUD_NAME, CLOUDINARY_API_KEY, CLOUDINARY_API_SECRET.
 // ─────────────────────────────────────────────────────────────
 async function handleUpload(request, env) {
+  if (!env.CLOUDINARY_CLOUD_NAME || !env.CLOUDINARY_API_KEY || !env.CLOUDINARY_API_SECRET) {
+    return json({ error: "Cloudinary not configured — set CLOUDINARY_CLOUD_NAME, CLOUDINARY_API_KEY, CLOUDINARY_API_SECRET secrets" }, 500);
+  }
+
   let form;
   try {
     form = await request.formData();
@@ -218,40 +222,39 @@ async function handleUpload(request, env) {
     return json({ error: "File too large (max 50 MB)" }, 413);
   }
 
-  // Get HubSpot token using existing OAuth credentials
-  const token = await getHubspotToken(env);
-  if (!token) {
-    return json({ error: "HubSpot auth failed — check CLIENT_ID, CLIENT_SECRET, REFRESH_TOKEN secrets" }, 500);
-  }
+  const slug      = company.toLowerCase().replace(/[^a-z0-9]+/g, "-").replace(/^-|-$/g, "").slice(0, 40) || "unknown";
+  const date      = new Date().toISOString().slice(0, 10);
+  const uid       = crypto.randomUUID().slice(0, 8);
+  const safeName  = file.name.replace(/\.[^.]+$/, "").replace(/[^a-zA-Z0-9_-]/g, "_").slice(0, 80);
+  const publicId  = `supy-onboarding/${date}_${slug}/${uid}_${safeName}`;
+  const timestamp = Math.floor(Date.now() / 1000).toString();
 
-  const slug     = company.toLowerCase().replace(/[^a-z0-9]+/g, "-").replace(/^-|-$/g, "").slice(0, 40) || "unknown";
-  const date     = new Date().toISOString().slice(0, 10);
-  const uid      = crypto.randomUUID().slice(0, 8);
-  const safeName = file.name.replace(/[^a-zA-Z0-9._-]/g, "_");
-  const folder   = `supy-onboarding/${date}_${slug}`;
+  // Build Cloudinary signed upload signature (SHA-1 of sorted params + api_secret)
+  const sigParams  = `folder=supy-onboarding/${date}_${slug}&public_id=${publicId}&timestamp=${timestamp}`;
+  const sigInput   = sigParams + env.CLOUDINARY_API_SECRET;
+  const sigBuffer  = await crypto.subtle.digest("SHA-1", new TextEncoder().encode(sigInput));
+  const signature  = Array.from(new Uint8Array(sigBuffer)).map(b => b.toString(16).padStart(2, "0")).join("");
 
-  // Build multipart form for HubSpot Files API v3
-  const hsForm = new FormData();
-  hsForm.append("file", new Blob([await file.arrayBuffer()], { type: file.type || "application/octet-stream" }), safeName);
-  hsForm.append("folderPath", folder);
-  hsForm.append("options", JSON.stringify({ access: "PUBLIC_INDEXABLE", overwrite: false, duplicateValidationStrategy: "NONE" }));
-  hsForm.append("fileName", `${uid}_${safeName}`);
+  const clForm = new FormData();
+  clForm.append("file",      new Blob([await file.arrayBuffer()], { type: file.type || "application/octet-stream" }), file.name);
+  clForm.append("api_key",   env.CLOUDINARY_API_KEY);
+  clForm.append("timestamp", timestamp);
+  clForm.append("signature", signature);
+  clForm.append("public_id", publicId);
+  clForm.append("folder",    `supy-onboarding/${date}_${slug}`);
 
-  const uploadRes = await fetch("https://api.hubapi.com/files/v3/files", {
-    method:  "POST",
-    headers: { Authorization: `Bearer ${token}` },
-    body:    hsForm,
-  });
-
+  const uploadRes  = await fetch(
+    `https://api.cloudinary.com/v1_1/${env.CLOUDINARY_CLOUD_NAME}/auto/upload`,
+    { method: "POST", body: clForm }
+  );
   const uploadJson = await uploadRes.json();
 
   if (!uploadRes.ok) {
-    console.error("HubSpot file upload failed", uploadRes.status, JSON.stringify(uploadJson));
-    return json({ error: `File upload failed: ${uploadJson.message || uploadRes.status}` }, 500);
+    console.error("Cloudinary upload failed", uploadRes.status, JSON.stringify(uploadJson));
+    return json({ error: `File upload failed: ${uploadJson.error?.message || uploadRes.status}` }, 500);
   }
 
-  const fileUrl = uploadJson.url;
-  return json({ url: fileUrl, key: uploadJson.id, name: file.name, size: file.size });
+  return json({ url: uploadJson.secure_url, key: uploadJson.public_id, name: file.name, size: file.size });
 }
 
 async function appendLog(env, email, company, submittedAt, status) {
