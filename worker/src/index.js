@@ -69,6 +69,10 @@ export default {
       return handleUpload(request, env);
     }
 
+    if (url.pathname === "/download" && request.method === "GET") {
+      return handleDownload(request, env);
+    }
+
     if (url.pathname === "/logs" && request.method === "GET") {
       return handleLogs(env);
     }
@@ -271,7 +275,64 @@ async function handleUpload(request, env) {
     return json({ error: `File upload failed: ${uploadJson.error?.message || uploadRes.status}` }, 500);
   }
 
-  return json({ url: uploadJson.secure_url, key: uploadJson.public_id, name: file.name, size: file.size });
+  return json({
+    url:  `https://supy-onboarding.vaishnavi-5d1.workers.dev/download?key=${encodeURIComponent(uploadJson.public_id)}&name=${encodeURIComponent(file.name)}`,
+    key:  uploadJson.public_id,
+    name: file.name,
+    size: file.size,
+  });
+}
+
+// ─────────────────────────────────────────────────────────────
+// File download proxy  (GET /download?key=<public_id>&name=<filename>)
+// Cloudinary raw files require signed delivery. This endpoint
+// generates a signed archive URL on the fly using the API credentials
+// and streams the file to the browser — so every stored URL keeps
+// working permanently regardless of Cloudinary delivery restrictions.
+// ─────────────────────────────────────────────────────────────
+async function handleDownload(request, env) {
+  if (!env.CLOUDINARY_CLOUD_NAME || !env.CLOUDINARY_API_KEY || !env.CLOUDINARY_API_SECRET) {
+    return json({ error: "Cloudinary not configured" }, 500);
+  }
+
+  const params    = new URL(request.url).searchParams;
+  const publicId  = params.get("key");
+  const filename  = params.get("name") || publicId?.split("/").pop() || "download";
+
+  if (!publicId) return json({ error: "Missing ?key= parameter" }, 400);
+
+  // Build a signed generate_archive URL.
+  // Cloudinary signs arrays as comma-joined values: public_ids=a,b,c
+  // Params sorted alphabetically: mode < public_ids < timestamp
+  const timestamp = Math.floor(Date.now() / 1000).toString();
+  const toSign    = `mode=download&public_ids=${publicId.replace(/&/g, "%26")}&timestamp=${timestamp}${env.CLOUDINARY_API_SECRET}`;
+  const sigBuf    = await crypto.subtle.digest("SHA-1", new TextEncoder().encode(toSign));
+  const signature = Array.from(new Uint8Array(sigBuf)).map(b => b.toString(16).padStart(2, "0")).join("");
+
+  const archiveUrl = `https://api.cloudinary.com/v1_1/${env.CLOUDINARY_CLOUD_NAME}/raw/generate_archive`
+    + `?mode=download`
+    + `&public_ids%5B%5D=${encodeURIComponent(publicId)}`
+    + `&timestamp=${timestamp}`
+    + `&api_key=${env.CLOUDINARY_API_KEY}`
+    + `&signature=${signature}`;
+
+  const upstream = await fetch(archiveUrl);
+  if (!upstream.ok) {
+    const err = await upstream.text();
+    console.error("Cloudinary download failed", upstream.status, err);
+    return json({ error: `Download failed: ${upstream.status}` }, 502);
+  }
+
+  // Stream straight to the browser with the correct filename
+  return new Response(upstream.body, {
+    status: 200,
+    headers: {
+      ...CORS_HEADERS,
+      "Content-Type":        upstream.headers.get("Content-Type") || "application/octet-stream",
+      "Content-Disposition": `attachment; filename="${filename}"`,
+      "Cache-Control":       "no-store",
+    },
+  });
 }
 
 async function appendLog(env, email, company, submittedAt, status) {
