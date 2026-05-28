@@ -74,18 +74,35 @@ export default {
     }
 
     if (url.pathname === "/debug" && request.method === "GET") {
+      // Test Cloudinary connectivity
+      let cloudinaryReachable = false;
+      let cloudinaryError = null;
+      if (env.CLOUDINARY_CLOUD_NAME && env.CLOUDINARY_API_KEY) {
+        try {
+          const r = await fetch(`https://api.cloudinary.com/v1_1/${env.CLOUDINARY_CLOUD_NAME}/resources/image?max_results=1`, {
+            headers: { Authorization: "Basic " + btoa(`${env.CLOUDINARY_API_KEY}:${env.CLOUDINARY_API_SECRET}`) },
+          });
+          cloudinaryReachable = r.ok;
+          if (!cloudinaryReachable) cloudinaryError = `HTTP ${r.status}`;
+        } catch (e) {
+          cloudinaryError = e.message;
+        }
+      }
       return json({
-        CLIENT_ID:           Boolean(env.CLIENT_ID),
-        CLIENT_SECRET:       Boolean(env.CLIENT_SECRET),
-        REFRESH_TOKEN:       Boolean(env.REFRESH_TOKEN),
-        GMAIL_CLIENT_ID:     Boolean(env.GMAIL_CLIENT_ID),
-        GMAIL_CLIENT_SECRET: Boolean(env.GMAIL_CLIENT_SECRET),
-        GMAIL_REFRESH_TOKEN: Boolean(env.GMAIL_REFRESH_TOKEN),
-        SLACK_WEBHOOK_URL:   Boolean(env.SLACK_WEBHOOK_URL),
-        GOOGLE_SCRIPT_URL:   Boolean(env.GOOGLE_SCRIPT_URL),
-        SUPABASE_URL:        Boolean(env.SUPABASE_URL),
-        SUPABASE_ANON_KEY:   Boolean(env.SUPABASE_ANON_KEY),
-        SLACK_TEST_WEBHOOK:  Boolean(env.SLACK_TEST_WEBHOOK_URL),
+        CLIENT_ID:            Boolean(env.CLIENT_ID),
+        CLIENT_SECRET:        Boolean(env.CLIENT_SECRET),
+        REFRESH_TOKEN:        Boolean(env.REFRESH_TOKEN),
+        GMAIL_CLIENT_ID:      Boolean(env.GMAIL_CLIENT_ID),
+        GMAIL_CLIENT_SECRET:  Boolean(env.GMAIL_CLIENT_SECRET),
+        GMAIL_REFRESH_TOKEN:  Boolean(env.GMAIL_REFRESH_TOKEN),
+        SLACK_WEBHOOK_URL:    Boolean(env.SLACK_WEBHOOK_URL),
+        GOOGLE_SCRIPT_URL:    Boolean(env.GOOGLE_SCRIPT_URL),
+        CLOUDINARY_CLOUD_NAME: Boolean(env.CLOUDINARY_CLOUD_NAME),
+        CLOUDINARY_API_KEY:    Boolean(env.CLOUDINARY_API_KEY),
+        CLOUDINARY_API_SECRET: Boolean(env.CLOUDINARY_API_SECRET),
+        SLACK_TEST_WEBHOOK:   Boolean(env.SLACK_TEST_WEBHOOK_URL),
+        cloudinary_reachable: cloudinaryReachable,
+        cloudinary_error:     cloudinaryError,
       });
     }
 
@@ -198,7 +215,7 @@ async function handleLogs(env) {
 // File upload  (POST /upload)
 // Accepts multipart/form-data: file + company.
 // Stores to Cloudinary and returns the secure public URL.
-// Uses signed uploads with CLOUDINARY_CLOUD_NAME, CLOUDINARY_API_KEY, CLOUDINARY_API_SECRET.
+// Requires: CLOUDINARY_CLOUD_NAME, CLOUDINARY_API_KEY, CLOUDINARY_API_SECRET secrets.
 // ─────────────────────────────────────────────────────────────
 async function handleUpload(request, env) {
   if (!env.CLOUDINARY_CLOUD_NAME || !env.CLOUDINARY_API_KEY || !env.CLOUDINARY_API_SECRET) {
@@ -226,14 +243,15 @@ async function handleUpload(request, env) {
   const date      = new Date().toISOString().slice(0, 10);
   const uid       = crypto.randomUUID().slice(0, 8);
   const safeName  = file.name.replace(/\.[^.]+$/, "").replace(/[^a-zA-Z0-9_-]/g, "_").slice(0, 80);
+  // Full path as public_id (no separate folder param — avoids double-nesting)
   const publicId  = `supy-onboarding/${date}_${slug}/${uid}_${safeName}`;
   const timestamp = Math.floor(Date.now() / 1000).toString();
 
-  // Build Cloudinary signed upload signature (SHA-1 of sorted params + api_secret)
-  const sigParams  = `folder=supy-onboarding/${date}_${slug}&public_id=${publicId}&timestamp=${timestamp}`;
-  const sigInput   = sigParams + env.CLOUDINARY_API_SECRET;
-  const sigBuffer  = await crypto.subtle.digest("SHA-1", new TextEncoder().encode(sigInput));
-  const signature  = Array.from(new Uint8Array(sigBuffer)).map(b => b.toString(16).padStart(2, "0")).join("");
+  // Cloudinary signed upload: signature = SHA1(sorted_params + api_secret)
+  // Params sent: public_id, timestamp (alphabetical order)
+  const sigInput  = `public_id=${publicId}&timestamp=${timestamp}${env.CLOUDINARY_API_SECRET}`;
+  const sigBuffer = await crypto.subtle.digest("SHA-1", new TextEncoder().encode(sigInput));
+  const signature = Array.from(new Uint8Array(sigBuffer)).map(b => b.toString(16).padStart(2, "0")).join("");
 
   const clForm = new FormData();
   clForm.append("file",      new Blob([await file.arrayBuffer()], { type: file.type || "application/octet-stream" }), file.name);
@@ -241,7 +259,6 @@ async function handleUpload(request, env) {
   clForm.append("timestamp", timestamp);
   clForm.append("signature", signature);
   clForm.append("public_id", publicId);
-  clForm.append("folder",    `supy-onboarding/${date}_${slug}`);
 
   const uploadRes  = await fetch(
     `https://api.cloudinary.com/v1_1/${env.CLOUDINARY_CLOUD_NAME}/auto/upload`,
@@ -377,15 +394,32 @@ async function linkEverything(token, noteId, contactId, companyName) {
     }
   } catch {}
 
-  // Company → link contact, note, and company's deals
+  // Company — search first, create if missing, then link contact + note
   try {
     const comps = await fetch("https://api.hubapi.com/crm/v3/objects/companies/search", {
       method: "POST", headers,
       body: JSON.stringify({ filterGroups: [{ filters: [{ propertyName: "name", operator: "CONTAINS_TOKEN", value: companyName }] }] }),
     });
     const compResults = (await comps.json()).results || [];
+
+    let compId;
     if (compResults.length > 0) {
-      const compId = compResults[0].id;
+      compId = compResults[0].id;
+    } else {
+      // No company found — create one
+      const createComp = await fetch("https://api.hubapi.com/crm/v3/objects/companies", {
+        method: "POST", headers,
+        body: JSON.stringify({ properties: { name: companyName } }),
+      });
+      if (createComp.status === 201) {
+        const created = await createComp.json();
+        compId = created.id;
+      } else {
+        console.error("HubSpot company create failed", createComp.status, await createComp.text());
+      }
+    }
+
+    if (compId) {
       await assoc("Contacts", contactId, "Companies", compId, "contact_to_company");
       await assoc("Notes",    noteId,    "Companies", compId, "note_to_company");
       const compDeals = await fetch(`https://api.hubapi.com/crm/v3/objects/companies/${compId}/associations/deals`, { headers });
