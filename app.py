@@ -186,7 +186,13 @@ def send_email_notification(d, branches, submitted_at, cid):
     msg = MIMEMultipart("alternative")
     msg["Subject"] = f"🚀 New Onboarding: {company}"
     msg["From"], msg["To"] = EMAIL_FROM, ", ".join(EMAIL_RECIPIENTS)
-    html_body = f"<h3>New Onboarding Submission</h3><p><b>Company:</b> {company}<br><b>Submitted:</b> {submitted_at}</p><p>A new onboarding form has been successfully logged. All branch details, POS information, and accounting setups have been recorded.</p><br><a href='{hs_link}' style='display:inline-block;padding:10px 15px;background-color:#321e57;color:white;text-decoration:none;border-radius:5px;'>Open Contact in HubSpot</a>"
+    note_body = build_note(d, branches, submitted_at)
+    html_body = (
+        f"<div style='font-family:Arial,sans-serif;max-width:700px;margin:auto;padding:24px;border:1px solid #e0d8f0;border-radius:8px'>"
+        f"{note_body}"
+        f"<br><a href='{hs_link}' style='display:inline-block;padding:10px 15px;background-color:#321e57;color:white;text-decoration:none;border-radius:5px;'>Open Contact in HubSpot</a>"
+        f"</div>"
+    )
     msg.attach(MIMEText(html_body, "html"))
     raw = base64.urlsafe_b64encode(msg.as_bytes()).decode()
     r = requests.post("https://gmail.googleapis.com/gmail/v1/users/me/messages/send", headers={"Authorization": f"Bearer {token}", "Content-Type": "application/json"}, json={"raw": raw})

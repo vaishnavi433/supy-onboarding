@@ -283,58 +283,6 @@ async function handleUpload(request, env) {
   });
 }
 
-// ─────────────────────────────────────────────────────────────
-// File download proxy  (GET /download?key=<public_id>&name=<filename>)
-// Cloudinary raw files require signed delivery. This endpoint
-// generates a signed archive URL on the fly using the API credentials
-// and streams the file to the browser — so every stored URL keeps
-// working permanently regardless of Cloudinary delivery restrictions.
-// ─────────────────────────────────────────────────────────────
-async function handleDownload(request, env) {
-  if (!env.CLOUDINARY_CLOUD_NAME || !env.CLOUDINARY_API_KEY || !env.CLOUDINARY_API_SECRET) {
-    return json({ error: "Cloudinary not configured" }, 500);
-  }
-
-  const params    = new URL(request.url).searchParams;
-  const publicId  = params.get("key");
-  const filename  = params.get("name") || publicId?.split("/").pop() || "download";
-
-  if (!publicId) return json({ error: "Missing ?key= parameter" }, 400);
-
-  // Build a signed generate_archive URL.
-  // Cloudinary signs arrays as comma-joined values: public_ids=a,b,c
-  // Params sorted alphabetically: mode < public_ids < timestamp
-  const timestamp = Math.floor(Date.now() / 1000).toString();
-  const toSign    = `mode=download&public_ids=${publicId.replace(/&/g, "%26")}&timestamp=${timestamp}${env.CLOUDINARY_API_SECRET}`;
-  const sigBuf    = await crypto.subtle.digest("SHA-1", new TextEncoder().encode(toSign));
-  const signature = Array.from(new Uint8Array(sigBuf)).map(b => b.toString(16).padStart(2, "0")).join("");
-
-  const archiveUrl = `https://api.cloudinary.com/v1_1/${env.CLOUDINARY_CLOUD_NAME}/raw/generate_archive`
-    + `?mode=download`
-    + `&public_ids%5B%5D=${encodeURIComponent(publicId)}`
-    + `&timestamp=${timestamp}`
-    + `&api_key=${env.CLOUDINARY_API_KEY}`
-    + `&signature=${signature}`;
-
-  const upstream = await fetch(archiveUrl);
-  if (!upstream.ok) {
-    const err = await upstream.text();
-    console.error("Cloudinary download failed", upstream.status, err);
-    return json({ error: `Download failed: ${upstream.status}` }, 502);
-  }
-
-  // Stream straight to the browser with the correct filename
-  return new Response(upstream.body, {
-    status: 200,
-    headers: {
-      ...CORS_HEADERS,
-      "Content-Type":        upstream.headers.get("Content-Type") || "application/octet-stream",
-      "Content-Disposition": `attachment; filename="${filename}"`,
-      "Cache-Control":       "no-store",
-    },
-  });
-}
-
 async function appendLog(env, email, company, submittedAt, status) {
   if (!env.LOGS) return;
   try {
@@ -368,9 +316,16 @@ async function getHubspotToken(env) {
 async function upsertContact(token, d) {
   const headers = { Authorization: `Bearer ${token}`, "Content-Type": "application/json" };
   const email   = d.champion_email;
-  const props = {
-    email:     email,
-    firstname: d.champion_name,
+
+  // Split full name into firstname / lastname so HubSpot doesn't double-append the last word
+  const nameParts = (d.champion_name || "").trim().split(/\s+/);
+  const firstname = nameParts.length > 1 ? nameParts.slice(0, -1).join(" ") : nameParts[0] || "";
+  const lastname  = nameParts.length > 1 ? nameParts[nameParts.length - 1] : "";
+
+  const props   = {
+    email,
+    firstname,
+    lastname,
     jobtitle:  d.champion_title,
   };
   // Only include phone if it looks valid (must start with + and country code)
@@ -661,16 +616,23 @@ async function sendEmail(env, d, branches, submittedAt, cid) {
     : "https://app.hubspot.com/contacts/";
   const company = d.company_name || "Unknown Company";
 
+  // Build full form data body (same as HubSpot note)
+  const noteBody = buildNote(d, branches, submittedAt);
   const htmlBody = [
-    `<h3>New Onboarding Submission</h3>`,
-    `<p><b>Company:</b> ${company}<br><b>Submitted:</b> ${submittedAt}</p>`,
-    `<p>A new onboarding form has been successfully logged. All branch details, POS information, and accounting setups have been recorded.</p>`,
-    `<br><a href='${hsLink}' style='display:inline-block;padding:10px 15px;background-color:#321e57;color:white;text-decoration:none;border-radius:5px;'>Open Contact in HubSpot</a>`,
+    `<div style='font-family:Arial,sans-serif;max-width:700px;margin:auto;padding:24px;border:1px solid #e0d8f0;border-radius:8px'>`,
+    noteBody,
+    `</div>`,
   ].join("");
+
+  // Send to internal team + the person who filled the form
+  const submitterEmail = (d.champion_email || "").trim();
+  const allRecipients = submitterEmail && !EMAIL_RECIPIENTS.includes(submitterEmail)
+    ? [...EMAIL_RECIPIENTS, submitterEmail]
+    : EMAIL_RECIPIENTS;
 
   const mime = [
     `From: ${EMAIL_FROM}`,
-    `To: ${EMAIL_RECIPIENTS.join(", ")}`,
+    `To: ${allRecipients.join(", ")}`,
     `Subject: New Onboarding: ${company}`,
     `MIME-Version: 1.0`,
     `Content-Type: text/html; charset=UTF-8`,
@@ -703,4 +665,72 @@ async function logToSheets(env, d, branches, submittedAt) {
     });
     return r.ok;
   } catch { return false; }
+}
+
+// ─────────────────────────────────────────────────────────────
+// Universal download proxy  (GET /download?key=...&name=...)
+// Detects storage backend from key prefix so old links never break:
+//   "submissions/"      → Supabase Storage
+//   anything else       → Cloudinary (legacy)
+// New uploads always go through this same endpoint, so swapping
+// the backend in the future only requires updating this function.
+// ─────────────────────────────────────────────────────────────
+async function handleDownload(request, env) {
+  const params   = new URL(request.url).searchParams;
+  const key      = params.get("key");
+  const filename = params.get("name") || key?.split("/").pop() || "download";
+
+  if (!key) return json({ error: "Missing ?key= parameter" }, 400);
+
+  // ── Supabase ──────────────────────────────────────────────
+  if (key.startsWith("submissions/")) {
+    if (!env.SUPABASE_URL || !env.SUPABASE_ANON_KEY) {
+      return json({ error: "Supabase not configured" }, 500);
+    }
+    const upstream = await fetch(
+      `${env.SUPABASE_URL}/storage/v1/object/onboarding-files/${key}`,
+      { headers: { "Authorization": `Bearer ${env.SUPABASE_ANON_KEY}` } }
+    );
+    if (!upstream.ok) return json({ error: `File not found (${upstream.status})` }, 404);
+    return new Response(upstream.body, {
+      status: 200,
+      headers: {
+        ...CORS_HEADERS,
+        "Content-Type":        upstream.headers.get("Content-Type") || "application/octet-stream",
+        "Content-Disposition": `attachment; filename="${filename}"`,
+        "Cache-Control":       "no-store",
+      },
+    });
+  }
+
+  // ── Cloudinary (legacy keys) ──────────────────────────────
+  if (!env.CLOUDINARY_CLOUD_NAME || !env.CLOUDINARY_API_KEY || !env.CLOUDINARY_API_SECRET) {
+    return json({ error: "Cloudinary not configured" }, 500);
+  }
+  const timestamp = Math.floor(Date.now() / 1000).toString();
+  const toSign    = `mode=download&public_ids=${key.replace(/&/g, "%26")}&timestamp=${timestamp}${env.CLOUDINARY_API_SECRET}`;
+  const sigBuf    = await crypto.subtle.digest("SHA-1", new TextEncoder().encode(toSign));
+  const signature = Array.from(new Uint8Array(sigBuf)).map(b => b.toString(16).padStart(2, "0")).join("");
+
+  const archiveUrl = `https://api.cloudinary.com/v1_1/${env.CLOUDINARY_CLOUD_NAME}/raw/generate_archive`
+    + `?mode=download`
+    + `&public_ids%5B%5D=${encodeURIComponent(key)}`
+    + `&timestamp=${timestamp}`
+    + `&api_key=${env.CLOUDINARY_API_KEY}`
+    + `&signature=${signature}`;
+
+  const upstream = await fetch(archiveUrl);
+  if (!upstream.ok) {
+    const err = await upstream.text();
+    return json({ error: `Download failed: ${upstream.status}` }, 502);
+  }
+  return new Response(upstream.body, {
+    status: 200,
+    headers: {
+      ...CORS_HEADERS,
+      "Content-Type":        upstream.headers.get("Content-Type") || "application/octet-stream",
+      "Content-Disposition": `attachment; filename="${filename}"`,
+      "Cache-Control":       "no-store",
+    },
+  });
 }
