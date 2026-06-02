@@ -171,7 +171,7 @@ function sendDraftReminders() {
 
     var subject = "Reminder: Complete your Supy onboarding form";
     var body = "<div style='font-family:Arial,sans-serif;max-width:600px;padding:24px'>"
-      + "<img src='https://supy.io/wp-content/uploads/2021/09/supy-logo.png' height='32' style='margin-bottom:20px'><br>"
+      + "<img src='https://cdn.prod.website-files.com/68933e53d968ca7f0c808561/690cc143814230554277cf54_supy-favicon.svg' height='32' style='margin-bottom:20px'><br>"
       + "<p>Hi " + name + ",</p>"
       + "<p>We noticed you started filling out the Supy onboarding form"
       + (company ? " for <b>" + company + "</b>" : "") + " but have not completed it yet.</p>"
